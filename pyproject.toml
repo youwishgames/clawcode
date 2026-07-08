@@ -76,6 +76,10 @@ dependencies = [
 [project.optional-dependencies]
 # Placeholder group for future Claw optional deps; core /claw mode uses main dependencies.
 claw-mode = []
+# ACP shim: expose ClawCode to Agent Client Protocol clients (Zed, vscode-acp). Run: python -m clawcode.acp_shim
+acp = [
+    "agent-client-protocol>=0.11.0",
+]
 # Rust PyO3 extension: pip install maturin, then maturin develop in core/engine-py (see llm/tools/performance/README.md).
 native-performance = [
     "clawcode-performance @ file:./clawcode/llm/tools/performance/core/engine-py",
