@@ -132,7 +132,7 @@ def get_builtin_tools(
         try:
             plugin_mcp = plugin_manager.get_merged_mcp_servers()
             if plugin_mcp:
-                from ..config import get_settings as _gs
+                from ...config import get_settings as _gs
                 _settings = _gs()
                 for k, v in plugin_mcp.items():
                     if k not in _settings.mcp_servers:
@@ -142,7 +142,7 @@ def get_builtin_tools(
 
     # MCP 工具（仅在配置了 MCP 服务器时有意义）
     try:
-        from ..config import get_settings
+        from ...config import get_settings
 
         settings = get_settings()
         if settings.mcp_servers:
