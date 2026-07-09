@@ -20,13 +20,16 @@ stdout carries JSON-RPC; all logging goes to stderr. `--cwd` pre-warms the runti
 
 ## Client setup (Cursor / VS Code)
 
-1. Install the owned fork of the ACP client extension (adds diff cards, tool output bodies, live checklist, usage meter, clickable locations, Claude Code-style layout):
+1. Install the owned fork of the ACP client extension (adds diff cards, tool output bodies, live checklist, usage meter, clickable locations, inline permission cards, parallel chat tabs, Claude Code-style layout):
    ```bash
    git clone https://github.com/youwishgames/vscode-acp && cd vscode-acp
-   npm install && npm run compile && npx vsce package --allow-missing-repository --no-dependencies
+   npm install && npm run compile && node tools/check_webview.js
+   npx vsce package --allow-missing-repository --no-dependencies
    cursor --install-extension acp-client-*.vsix
    ```
-   (Upstream `formulahendry.acp-client` from the marketplace also works, with plainer rendering. The fork is versioned 0.9.0 so the marketplace won't auto-update over it.)
+   (Upstream `formulahendry.acp-client` from the marketplace also works, with plainer rendering. The fork carries a bumped version so the marketplace won't auto-update over it.)
+
+   **Set `"acp.autoApprovePermissions": "ask"`.** If it is `"allowAll"`, no permission prompt ever reaches you — every tool call, including file-mutating bash commands, auto-approves silently.
 2. Register the agent in user settings:
 
 ```json
@@ -51,12 +54,30 @@ stdout carries JSON-RPC; all logging goes to stderr. `--cwd` pre-warms the runti
 | file writes (`write`/`edit`/`patch`) | diff card (`FileEditToolCallContent`): file snapshotted at TOOL_USE, diffed after |
 | `todo_write` tool (added by the shim) | `plan` update — live task checklist in the panel |
 | `AgentEventType.USAGE` | `usage_update` (token meter vs. the model's context window) |
-| `PermissionService` callback | `session/request_permission` (allow once / allow for session / reject) |
+| `PermissionService` callback | `session/request_permission` (see **Permissions** below) |
 | Plugin skills (`pm.get_all_skills()`) | `available_commands_update` (slash autocomplete) |
 | `/skill` messages | expanded via `plugin.slash.dispatch_slash`, same as the TUI |
+| `/revert`, `/revert all` | handled by the shim itself, before slash dispatch |
 | config option `model` | model picker — lists models from enabled providers in `.clawcode.json`; switching rebuilds the session's agent on the new engine |
 
-Each ACP session creates one ClawCode session (visible later in the TUI sidebar) with a full `tui_coder`-style runtime: system prompt, skills, MCP servers, and per-session permission grants.
+Each ACP session creates one ClawCode session (visible later in the TUI sidebar) with a full `tui_coder`-style runtime: system prompt, skills, MCP servers, and per-session permission grants. The fork's panel supports several **concurrent live sessions** on one shim process — the "+" button in a chat tab opens a new one rather than freezing the old.
+
+## Permissions
+
+`PermissionService` keys session-scoped grants by **tool name**. For most tools that is what you want. For `bash` it is not: "allow for this session" would mean *allow every shell command for the rest of the session*.
+
+So the shim scopes bash grants to the **exact command string** (whitespace-normalized), tracked in `_SessionState.approved_commands`:
+
+- `allow_once` — run this one call.
+- `allow_command` — *"Always allow `npm test` this session."* Offered for `bash` only. An identical later command is granted with no round-trip to the client. Withheld entirely from commands that `_command_mutates_files()` flags as writing to disk (`>`, `sed -i`, `rm`/`mv`/`cp`/`tee`, `git checkout|reset|commit|…`, `npm install`, `pip install`, `perl -i`, …).
+- `allow_always` — the old tool-scoped session grant. Offered for non-`bash`, non-`execute_code` tools only.
+- `reject`.
+
+`_command_mutates_files()` is a **mistake-catcher, not a security boundary**. `python -c "open('x','w')"` defeats it trivially. Bash bypasses the tool-layer file guards entirely (as it does in Claude Code); per-call visibility is the mitigation.
+
+## `/revert`
+
+`_SessionState.file_baseline` snapshots each file the session is about to touch (existence + contents) at `TOOL_USE` time, for `write`/`edit`/`patch`. `/revert` lists what would be undone; `/revert all` restores every snapshotted file and deletes the ones the session created. It does **not** undo anything `bash` did.
 
 ## Regression drill
 
@@ -68,6 +89,7 @@ Each ACP session creates one ClawCode session (visible later in the TUI sidebar)
 
 ## Limitations
 
-- One working directory per shim process (first session wins; a warning is logged if a later session asks for a different cwd).
+- One working directory per shim process (first session wins; a warning is logged if a later session asks for a different cwd). Parallel chat tabs therefore share one checkout — the per-session stale-read guard (`clawcode/llm/tools/file_guard.py`) stops them clobbering each other's edits, but git state is shared, so **commit from one tab only**.
+- `/revert` and the file guards cover `write`/`edit`/`patch`. `bash` mutations are invisible to both.
 - Model switching from the panel changes the in-memory agent config only — it does not persist to `.clawcode.json`, and it applies process-wide (new sessions inherit the last switch).
 - `session/load` (history replay) is not implemented.
