@@ -62,6 +62,14 @@ class OpenRouterProvider(BaseProvider):
             app_name: Optional app name for rankings
             **kwargs: Additional options
         """
+        # Reasoning support (OpenRouter unified `reasoning` param). Enabled by
+        # default so reasoning-capable models (GLM, DeepSeek-R1, o-series, ...)
+        # stream their thinking; models that don't support it ignore the
+        # param. Disable per-provider with `"reasoning_enabled": false` in
+        # .clawcode.json; tune effort with `"reasoning_effort"`.
+        reasoning_enabled = bool(kwargs.pop("reasoning_enabled", True))
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+
         super().__init__(
             model=model,
             api_key=api_key,
@@ -72,9 +80,20 @@ class OpenRouterProvider(BaseProvider):
         )
         self.site_url = site_url
         self.app_name = app_name
+        self.reasoning_enabled = reasoning_enabled
+        self.reasoning_effort = reasoning_effort
 
         # HTTP client
         self._client: httpx.AsyncClient | None = None
+
+    def _reasoning_body_param(self) -> dict[str, Any] | None:
+        """Build the OpenRouter `reasoning` request param, if enabled."""
+        if not self.reasoning_enabled:
+            return None
+        param: dict[str, Any] = {"enabled": True}
+        if self.reasoning_effort in ("low", "medium", "high"):
+            param["effort"] = self.reasoning_effort
+        return param
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -132,6 +151,9 @@ class OpenRouterProvider(BaseProvider):
                 "messages": formatted_messages,
                 "max_tokens": self.max_tokens,
             }
+            reasoning = self._reasoning_body_param()
+            if reasoning:
+                body["reasoning"] = reasoning
 
             # Add tools if provided
             if tools:
@@ -194,6 +216,9 @@ class OpenRouterProvider(BaseProvider):
                 "max_tokens": self.max_tokens,
                 "stream": True,
             }
+            reasoning = self._reasoning_body_param()
+            if reasoning:
+                body["reasoning"] = reasoning
 
             # Add tools if provided
             if tools:
@@ -208,6 +233,7 @@ class OpenRouterProvider(BaseProvider):
                 response.raise_for_status()
 
                 content = ""
+                thinking = ""
                 tool_calls: list[ToolCall] = []
                 current_tool_calls: dict[int, ToolCall] = {}
 
@@ -225,6 +251,13 @@ class OpenRouterProvider(BaseProvider):
                         continue
 
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
+
+                    # Handle reasoning/thinking (OpenRouter normalizes model
+                    # thinking into `delta.reasoning`)
+                    reasoning_text = delta.get("reasoning")
+                    if isinstance(reasoning_text, str) and reasoning_text:
+                        thinking += reasoning_text
+                        yield ProviderEvent.thinking_delta(reasoning_text)
 
                     # Handle content
                     if "content" in delta and delta["content"]:
@@ -279,6 +312,7 @@ class OpenRouterProvider(BaseProvider):
 
                         response_obj = ProviderResponse(
                             content=content,
+                            thinking=thinking,
                             tool_calls=tool_calls,
                             usage=usage,
                             finish_reason=finish_reason or "stop",
@@ -373,6 +407,7 @@ class OpenRouterProvider(BaseProvider):
         message = choice.get("message", {})
 
         content = message.get("content", "") or ""
+        thinking = message.get("reasoning", "") or ""
         tool_calls = []
 
         # Parse tool calls
@@ -404,6 +439,7 @@ class OpenRouterProvider(BaseProvider):
 
         return ProviderResponse(
             content=content,
+            thinking=thinking,
             tool_calls=tool_calls,
             usage=usage,
             finish_reason=choice.get("finish_reason", "stop"),
