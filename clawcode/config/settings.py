@@ -624,8 +624,9 @@ class Settings(BaseSettings):
     # Plugins (Claude Code compatible)
     plugins: PluginConfig = Field(default_factory=PluginConfig)
 
-    # Auto Compact
-    auto_compact: bool = True
+    # Auto Compact — fork default OFF (upstream defaults on): compaction
+    # silently rewrites history; the owner prefers explicit /compact only.
+    auto_compact: bool = False
 
     #: When True and safe (no streaming/subagent tools in the batch, and either no
     #: permission client or every tool is read-only), run multiple tool_calls from

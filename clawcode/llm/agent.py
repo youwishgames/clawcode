@@ -577,6 +577,11 @@ class Agent:
         """Best-effort context compaction for strict context-window providers."""
         if not self._summarizer or not history:
             return history
+        # Fork: auto-compaction is opt-in (settings.auto_compact, default
+        # False). Manual /compact in the TUI is unaffected — it builds its
+        # own SummarizerService.
+        if self._settings is not None and not bool(getattr(self._settings, "auto_compact", False)):
+            return history
         model = getattr(self._provider, "model", None)
         try:
             now = time.monotonic()

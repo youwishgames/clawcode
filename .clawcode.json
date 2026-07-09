@@ -463,7 +463,7 @@
     "access_token": null,
     "enabled": false
   },
-  "auto_compact": true,
+  "auto_compact": false,
   "context_paths": [
     ".github/copilot-instructions.md",
     ".cursorrules",
