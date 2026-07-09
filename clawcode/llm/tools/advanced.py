@@ -536,7 +536,11 @@ class EditTool(BaseTool):
                                 },
                                 "count": {
                                     "type": "integer",
-                                    "description": "Maximum number of replacements (0 = all).",
+                                    "description": "Maximum number of replacements (0 = require unique match unless replace_all).",
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "Replace every occurrence of old_text (default: false — old_text must match exactly once).",
                                 },
                             },
                             "required": ["old_text", "new_text"],
@@ -625,11 +629,12 @@ class EditTool(BaseTool):
                 file_content = before_content
 
                 total_replacements = 0
-                for repl in replacements:
+                for repl_idx, repl in enumerate(replacements, start=1):
                     old_text = repl.get("old_text", "")
                     new_text = repl.get("new_text", "")
                     use_regex = repl.get("regex", False)
                     count = repl.get("count", 0)
+                    replace_all = bool(repl.get("replace_all", False))
 
                     if not old_text:
                         continue
@@ -641,15 +646,35 @@ class EditTool(BaseTool):
                             )
                         else:
                             file_content, n = re.subn(old_text, new_text, file_content)
+                        if n == 0:
+                            raise ValueError(
+                                f"regex pattern matched nothing (replacement #{repl_idx}). "
+                                "Re-read the file and retry with a pattern that matches its current content."
+                            )
                     else:
+                        n_found = file_content.count(old_text)
+                        if n_found == 0:
+                            raise ValueError(
+                                f"old_text not found (replacement #{repl_idx}). "
+                                "The file may have changed — re-read it and retry with the exact current text."
+                            )
                         if count > 0:
-                            n_before = file_content.count(old_text)
                             file_content = file_content.replace(old_text, new_text, count)
-                            n_after = file_content.count(old_text)
-                            n = n_before - n_after
-                        else:
-                            n = file_content.count(old_text)
+                            n = min(count, n_found)
+                        elif replace_all:
                             file_content = file_content.replace(old_text, new_text)
+                            n = n_found
+                        else:
+                            # Uniqueness required: an ambiguous match silently
+                            # rewriting N locations is how files get corrupted.
+                            if n_found > 1:
+                                raise ValueError(
+                                    f"old_text matches {n_found} locations (replacement #{repl_idx}). "
+                                    "Include more surrounding context to make it unique, "
+                                    "or set replace_all: true (or count) to change every occurrence."
+                                )
+                            file_content = file_content.replace(old_text, new_text, 1)
+                            n = 1
 
                     total_replacements += int(n)
 
