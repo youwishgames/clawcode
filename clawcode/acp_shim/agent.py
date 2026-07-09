@@ -216,6 +216,10 @@ class _SessionState:
     turn_task: asyncio.Task | None = None
     # tool_call_id -> (abs_path, pre-edit text) captured at TOOL_USE for diff cards
     file_snapshots: dict[str, tuple[str, str | None]] = field(default_factory=dict)
+    # abs_path -> (existed_before, first-seen content) — session baseline for
+    # /revert. Content None while existed=True means unsnapshotable (too
+    # large/binary): report it but never touch it on revert.
+    file_baseline: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
     # tool_call_ids of todo_write calls (suppressed as tool rows, sent as plan updates)
     todo_call_ids: set[str] = field(default_factory=set)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -404,6 +408,11 @@ class ClawCodeAcpAgent(AcpAgent):
                 )
                 for skill in pm.get_all_skills()
             ]
+            # Shim built-ins (handled without the LLM).
+            commands.append(AvailableCommand(
+                name="revert",
+                description="List files this session changed (/revert) or restore them all (/revert all)",
+            ))
             if commands:
                 await self._conn.session_update(
                     session_id=session_id,
@@ -471,6 +480,16 @@ class ClawCodeAcpAgent(AcpAgent):
         if not text.strip():
             return PromptResponse(stop_reason="end_turn")
 
+        # Session file-change revert — handled by the shim, never the LLM.
+        stripped = text.strip().lower()
+        if stripped in ("/revert", "/revert all"):
+            reply = self._handle_revert(state, apply=stripped == "/revert all")
+            await self._conn.session_update(
+                session_id=session_id,
+                update=update_agent_message_text(reply),
+            )
+            return PromptResponse(stop_reason="end_turn")
+
         # Same slash-command expansion the TUI applies (/brain, /plugin, ...).
         text, plugin_reply = self._dispatch_slash(text)
         if plugin_reply is not None:
@@ -491,6 +510,59 @@ class ClawCodeAcpAgent(AcpAgent):
         finally:
             state.turn_task = None
         return PromptResponse(stop_reason="end_turn")
+
+    @staticmethod
+    def _handle_revert(state: "_SessionState", apply: bool) -> str:
+        """List (or restore) every file this session changed via write/edit/patch.
+
+        Baseline = the file's content the FIRST time a file-write tool touched
+        it this session. Bash-made changes are not tracked. Unsnapshotable
+        files (too large / binary) are reported but never modified.
+        """
+        if not state.file_baseline:
+            return (
+                "No file changes tracked in this session. "
+                "(Only write/edit/patch tool changes are tracked — bash changes are not.)"
+            )
+
+        lines: list[str] = []
+        errors: list[str] = []
+        for path, (existed, content) in sorted(state.file_baseline.items()):
+            if not apply:
+                label = (
+                    "created" if not existed
+                    else "modified — too large/binary, cannot revert" if content is None
+                    else "modified"
+                )
+                lines.append(f"- {path} ({label})")
+                continue
+            try:
+                p = Path(path)
+                if not existed:
+                    if p.is_file():
+                        p.unlink()
+                    lines.append(f"- deleted {path} (did not exist before this session)")
+                elif content is None:
+                    lines.append(f"- skipped {path} (no snapshot — too large/binary)")
+                else:
+                    p.write_text(content, encoding="utf-8")
+                    lines.append(f"- restored {path}")
+            except OSError as exc:
+                errors.append(f"- FAILED {path}: {exc}")
+
+        if not apply:
+            return (
+                f"{len(state.file_baseline)} file(s) changed by this session:\n"
+                + "\n".join(lines)
+                + "\n\nRun `/revert all` to restore every file to its pre-session state."
+                + " Only write/edit/patch tool changes are tracked — bash changes are not."
+            )
+
+        state.file_baseline.clear()
+        out = "Reverted this session's file changes:\n" + "\n".join(lines)
+        if errors:
+            out += "\n\nErrors:\n" + "\n".join(errors)
+        return out
 
     def _dispatch_slash(self, text: str) -> tuple[str, str | None]:
         """Expand /skill messages; returns (llm_text, direct_reply_or_None)."""
@@ -601,10 +673,14 @@ class ClawCodeAcpAgent(AcpAgent):
                 if file_path and tool_name in _FILE_WRITE_TOOLS:
                     # Snapshot pre-edit content now; diffed against the file
                     # after the tool completes.
-                    state.file_snapshots[tool_call_id] = (
-                        file_path,
-                        _read_file_for_diff(file_path),
-                    )
+                    pre_text = _read_file_for_diff(file_path)
+                    state.file_snapshots[tool_call_id] = (file_path, pre_text)
+                    # First touch this session? Record the baseline for /revert.
+                    if file_path not in state.file_baseline:
+                        state.file_baseline[file_path] = (
+                            Path(file_path).is_file(),
+                            pre_text,
+                        )
                 await conn.session_update(
                     session_id=session_id,
                     update=start_tool_call(
