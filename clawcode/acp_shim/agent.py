@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,50 @@ def _extract_file_path(tool_input: Any, working_directory: str) -> str | None:
         return str(p)
 
 
+# Shell constructs that can mutate the filesystem. Commands matching any of
+# these never get a sticky "always allow" grant — they are precisely the writes
+# that bypass the tool-layer guards and that /revert cannot undo.
+#
+# NOTE: this is a MISTAKE-CATCHER, not a security boundary. `python -c
+# "open('x','w')"` mutates files and is not detected. Its job is to stop
+# routine read-only commands (npm test, tsc, git status) from nagging, while
+# anything that obviously writes still surfaces on every call.
+_REDIRECT_NOISE = re.compile(r"(?:\d?>&\d|\d?>\s*/dev/null)")
+_MUTATING_PATTERNS = (
+    re.compile(r">"),  # any surviving redirect
+    re.compile(r"\bsed\b[^|;&]*\s-[a-zA-Z]*i"),  # sed -i / -Ei
+    re.compile(r"\b(rm|mv|cp|tee|truncate|dd|chmod|chown|ln|mkdir|touch)\b"),
+    re.compile(r"\bgit\s+(checkout|reset|clean|apply|restore|stash|commit|rm)\b"),
+    re.compile(r"\b(npm|pnpm|yarn)\s+(install|add|remove|uninstall)\b"),
+    re.compile(r"\bpip\s+(install|uninstall)\b"),
+    re.compile(r"\bperl\b[^|;&]*\s-i"),
+)
+
+
+def _normalize_command(command: str) -> str:
+    """Collapse whitespace so `npm  test` and `npm test` share one grant."""
+    return " ".join(str(command or "").split())
+
+
+def _command_mutates_files(command: str) -> bool:
+    """True when a shell command obviously writes to the filesystem."""
+    cleaned = _REDIRECT_NOISE.sub("", command or "")
+    return any(p.search(cleaned) for p in _MUTATING_PATTERNS)
+
+
+def _permission_command(request: PermissionRequest) -> str | None:
+    """The shell command a bash permission request is about, if any."""
+    if request.tool_name != "bash":
+        return None
+    params = request.input
+    if not isinstance(params, dict):
+        return None
+    cmd = params.get("command") or params.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return None
+    return _normalize_command(cmd)
+
+
 def _read_file_for_diff(path: str) -> str | None:
     """File text for a diff card, or None if unreadable/too big/binary."""
     try:
@@ -222,6 +267,10 @@ class _SessionState:
     file_baseline: dict[str, tuple[bool, str | None]] = field(default_factory=dict)
     # tool_call_ids of todo_write calls (suppressed as tool rows, sent as plan updates)
     todo_call_ids: set[str] = field(default_factory=set)
+    # Normalized bash commands the user approved for the whole session.
+    # Keyed by the exact command, not by the tool — "allow bash for this
+    # session" would be allow-everything (see _command_mutates_files).
+    approved_commands: set[str] = field(default_factory=set)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -434,6 +483,14 @@ class ClawCodeAcpAgent(AcpAgent):
             await state.permissions.deny(request.request_id)
             return
 
+        # Per-command session grants: a command the user already approved for
+        # this session runs without prompting again. The tool row still renders
+        # (it comes from the TOOL_USE event), so nothing becomes invisible.
+        command = _permission_command(request)
+        if command and command in state.approved_commands:
+            await state.permissions.grant(request.request_id)
+            return
+
         # Attach to the live tool-call row when it is the same tool.
         tool_call_id = f"perm-{request.request_id}"
         if state.current_tool and state.current_tool[1] == request.tool_name:
@@ -449,10 +506,24 @@ class ClawCodeAcpAgent(AcpAgent):
         options = [
             PermissionOption(option_id="allow_once", name="Allow once", kind="allow_once"),
         ]
-        # Bash/execute never gets a session-scoped grant: `sed -i`/`echo >`
-        # ride the execute kind past acceptEdits and dodge /revert tracking,
-        # so a session-wide bash allow is effectively allow-everything.
-        if _tool_kind(request.tool_name) != "execute":
+        if command is not None:
+            # Bash: the sticky grant is scoped to THIS command, never to the
+            # tool — a tool-wide bash grant is allow-everything. Commands that
+            # obviously write to disk get no sticky option at all: they bypass
+            # the tool-layer guards and /revert cannot undo them.
+            if not _command_mutates_files(command):
+                shown = command if len(command) <= 40 else command[:37] + "..."
+                options.append(
+                    PermissionOption(
+                        option_id="allow_command",
+                        name=f"Always allow `{shown}` this session",
+                        kind="allow_always",
+                    )
+                )
+        elif _tool_kind(request.tool_name) != "execute":
+            # File tools keep the tool-scoped session grant (/revert undoes them).
+            # execute_code gets none — its input is arbitrary code, not a stable
+            # command string, so there is nothing safe to remember.
             options.append(
                 PermissionOption(option_id="allow_always", name="Allow for this session", kind="allow_always"),
             )
@@ -471,6 +542,10 @@ class ClawCodeAcpAgent(AcpAgent):
             option_id = None
 
         if option_id == "allow_once":
+            await state.permissions.grant(request.request_id)
+        elif option_id == "allow_command" and command:
+            # Remember THIS command; grant is per-call at the service level.
+            state.approved_commands.add(command)
             await state.permissions.grant(request.request_id)
         elif option_id == "allow_always":
             await state.permissions.grant(request.request_id, session_scoped=True)
