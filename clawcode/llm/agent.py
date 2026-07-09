@@ -505,6 +505,9 @@ class Agent:
         self._subagent_semaphore = asyncio.Semaphore(max(1, _max_sub))
         # Read-only tool result cache to avoid redundant calls within a single Agent run
         self._tool_result_cache: dict[str, ToolResponse] = {}
+        # Signatures of successfully-executed write/edit/patch calls this run
+        # (duplicate-call guard). Cleared at the start of every run().
+        self._executed_write_signatures: set[str] = set()
 
     def _reset_closed_loop_metrics(self) -> None:
         """Per-run observability counters for closed-loop behavior."""
@@ -745,6 +748,7 @@ class Agent:
 
         self._active_requests[session_id] = True
         self._reset_closed_loop_metrics()
+        self._executed_write_signatures.clear()
 
         try:
             # --- Hook: SessionStart ---
@@ -1103,6 +1107,12 @@ class Agent:
         "search", "batch_view", "rg",
     })
 
+    # File-mutating tools protected by the duplicate-call guard: engines
+    # (GLM double-submit habit) sometimes issue the IDENTICAL call twice;
+    # with auto-approved permissions the repeat silently re-applies —
+    # anchored insertions duplicate their block each time.
+    _WRITE_GUARD_TOOLS = frozenset({"write", "edit", "patch"})
+
     def _should_parallelize_tool_calls(self, tool_calls: list[ToolCall]) -> bool:
         """True when parallel gather is allowed for this batch of tool calls.
 
@@ -1333,6 +1343,25 @@ class Agent:
                     _err = f"Permission denied by hook: {_reason}"
                     results_fragment.append(_persisted_tool_result_dict(tool_call, _err, True))
                     yield AgentEvent.tool_result(tool_name, tool_call.id, _err, True, True)
+                    return
+
+            # Duplicate-write guard: reject an IDENTICAL write/edit/patch call
+            # that already executed this run. Engines double-submit edits;
+            # re-applying an anchored insertion duplicates its block.
+            _write_sig: str | None = None
+            if tool_name in self._WRITE_GUARD_TOOLS:
+                _write_sig = f"{session_id}|{tool_name}:{json.dumps(tool_call.get_input_dict(), sort_keys=True, ensure_ascii=False)}"
+                if _write_sig in self._executed_write_signatures:
+                    _dup_msg = (
+                        f"Error: duplicate '{tool_name}' call — an identical call already "
+                        "executed this turn and the file was modified. Do NOT retry it "
+                        "verbatim. Re-read the file to see its current state before "
+                        "editing again."
+                    )
+                    results_fragment.append(
+                        _persisted_tool_result_dict(tool_call, _dup_msg, True)
+                    )
+                    yield AgentEvent.tool_result(tool_name, tool_call.id, _dup_msg, True, True)
                     return
 
             # Read-only tool cache: avoid redundant calls within a single Agent run
@@ -1592,6 +1621,9 @@ class Agent:
                 # Cache successful read-only tool results
                 if tool_name in self._READ_ONLY_TOOLS and not response.is_error:
                     self._tool_result_cache[_cache_key] = response
+                # Register successful write calls for the duplicate guard
+                if _write_sig is not None and not response.is_error:
+                    self._executed_write_signatures.add(_write_sig)
                 # --- Hook: PostToolUse / PostToolUseFailure (non-streaming) ---
                 if self._hook_engine:
                     _post_event = (
