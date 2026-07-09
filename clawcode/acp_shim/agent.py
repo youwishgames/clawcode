@@ -448,9 +448,17 @@ class ClawCodeAcpAgent(AcpAgent):
         )
         options = [
             PermissionOption(option_id="allow_once", name="Allow once", kind="allow_once"),
-            PermissionOption(option_id="allow_always", name="Allow for this session", kind="allow_always"),
-            PermissionOption(option_id="reject_once", name="Reject", kind="reject_once"),
         ]
+        # Bash/execute never gets a session-scoped grant: `sed -i`/`echo >`
+        # ride the execute kind past acceptEdits and dodge /revert tracking,
+        # so a session-wide bash allow is effectively allow-everything.
+        if _tool_kind(request.tool_name) != "execute":
+            options.append(
+                PermissionOption(option_id="allow_always", name="Allow for this session", kind="allow_always"),
+            )
+        options.append(
+            PermissionOption(option_id="reject_once", name="Reject", kind="reject_once"),
+        )
         try:
             response = await self._conn.request_permission(
                 session_id=acp_session_id,
