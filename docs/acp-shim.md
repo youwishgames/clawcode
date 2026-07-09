@@ -20,7 +20,13 @@ stdout carries JSON-RPC; all logging goes to stderr. `--cwd` pre-warms the runti
 
 ## Client setup (Cursor / VS Code)
 
-1. Install the extension: `cursor --install-extension formulahendry.acp-client`
+1. Install the owned fork of the ACP client extension (adds diff cards, tool output bodies, live checklist, usage meter, clickable locations, Claude Code-style layout):
+   ```bash
+   git clone https://github.com/youwishgames/vscode-acp && cd vscode-acp
+   npm install && npm run compile && npx vsce package --allow-missing-repository --no-dependencies
+   cursor --install-extension acp-client-*.vsix
+   ```
+   (Upstream `formulahendry.acp-client` from the marketplace also works, with plainer rendering. The fork is versioned 0.9.0 so the marketplace won't auto-update over it.)
 2. Register the agent in user settings:
 
 ```json
