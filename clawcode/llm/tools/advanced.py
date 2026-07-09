@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from .base import BaseTool, ToolInfo, ToolCall, ToolResponse, ToolContext
+from .file_guard import check_editable, record_read
 from .file_ops import assert_resolved_path_in_workspace, resolve_tool_path
 from ...utils.text import sanitize_text
 from typing import TYPE_CHECKING
@@ -368,6 +369,14 @@ class WriteTool(BaseTool):
         if _outside:
             return ToolResponse(content=_outside, is_error=True)
 
+        # Stale-read guard: overwriting an existing file requires a prior read
+        # this session, unchanged on disk since. Creating a file is exempt, as
+        # is appending (it does not depend on prior content).
+        if not append:
+            _stale = check_editable(context.session_id, path)
+            if _stale:
+                return ToolResponse(content=_stale, is_error=True)
+
         if self._permissions:
             from ...core.permission import PermissionRequest
 
@@ -395,7 +404,11 @@ class WriteTool(BaseTool):
                     is_error=True,
                 )
 
-        return await self._do_write(path, content, file_path, create_dirs, append)
+        resp = await self._do_write(path, content, file_path, create_dirs, append)
+        if not resp.is_error:
+            # Our own write becomes this session's new baseline.
+            record_read(context.session_id, path)
+        return resp
 
     async def _do_write(
         self,
@@ -596,6 +609,11 @@ class EditTool(BaseTool):
                 is_error=True,
             )
 
+        # Stale-read guard (see file_guard): must have read it, unchanged.
+        _stale = check_editable(context.session_id, path)
+        if _stale:
+            return ToolResponse(content=_stale, is_error=True)
+
         # Request permission
         if self._permissions:
             from ...core.permission import PermissionRequest
@@ -684,6 +702,8 @@ class EditTool(BaseTool):
                 return total_replacements, before_content, file_content
 
             total_replacements, before, after = await asyncio.to_thread(_edit_sync)
+            # Our own write becomes this session's new baseline.
+            record_read(context.session_id, path)
             diff_text = ""
             if before != after:
                 diff_text, _ = _make_unified_diff(before, after, file_path)
@@ -774,6 +794,11 @@ class PatchTool(BaseTool):
                 is_error=True,
             )
 
+        # Stale-read guard (see file_guard): must have read it, unchanged.
+        _stale = check_editable(context.session_id, path)
+        if _stale:
+            return ToolResponse(content=_stale, is_error=True)
+
         # Request permission
         if self._permissions:
             from ...core.permission import PermissionRequest
@@ -804,6 +829,8 @@ class PatchTool(BaseTool):
                 return original_content, result
 
             before, after = await asyncio.to_thread(_patch_sync)
+            # Our own write becomes this session's new baseline.
+            record_read(context.session_id, path)
             diff_text = ""
             if before != after:
                 diff_text, _ = _make_unified_diff(before, after, file_path)

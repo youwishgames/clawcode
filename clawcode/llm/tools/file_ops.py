@@ -261,6 +261,10 @@ class ViewTool(BaseTool):
 
         try:
             lines = await asyncio.to_thread(_read_lines_sync, path, offset, limit)
+            # Register the read so this session may modify the file.
+            from .file_guard import record_read
+
+            record_read(context.session_id, path)
             return ToolResponse(
                 content=sanitize_text("\n".join(lines)),
                 metadata=f"Read {len(lines)} lines from {file_path}",
@@ -334,6 +338,10 @@ class BatchViewTool(BaseTool):
             if not path.is_file():
                 return f"--- {fp} ---\nError: Not a file"
             lines = await asyncio.to_thread(_read_lines_sync, path, off, lim)
+            # Register the read so this session may modify the file.
+            from .file_guard import record_read
+
+            record_read(context.session_id, path)
             header = f"--- {fp} L{off + 1}-{off + len(lines)} ({len(lines)} lines) ---"
             return header + "\n" + "\n".join(lines)
 

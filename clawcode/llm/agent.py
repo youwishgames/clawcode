@@ -508,11 +508,6 @@ class Agent:
         # Signatures of successfully-executed write/edit/patch calls this run
         # (duplicate-call guard). Cleared at the start of every run().
         self._executed_write_signatures: set[str] = set()
-        # Stale-read guard: "session|abspath" -> mtime recorded when the file
-        # was last read (view/batch_view) or written by us. Edits to a file
-        # that was never read, or that changed on disk since, are rejected.
-        # Persists across runs — staleness is what makes cross-turn edits safe.
-        self._file_read_state: dict[str, float] = {}
         # Loop breaker: count of consecutive tool rounds where EVERY result
         # was an error. Reset per run and on any successful round.
         self._consecutive_failed_rounds = 0
@@ -1293,47 +1288,6 @@ class Agent:
             ):
                 yield evt
 
-    def _tool_target_paths(self, tool_name: str, params: dict[str, Any]) -> list[str]:
-        """Absolute file paths a view/batch_view/write/edit/patch call targets."""
-        from .tools.file_ops import resolve_tool_path
-
-        raw: list[str] = []
-        if tool_name == "batch_view":
-            for spec in params.get("files") or []:
-                if isinstance(spec, dict) and spec.get("file_path"):
-                    raw.append(str(spec["file_path"]))
-        else:
-            fp = (
-                params.get("file_path")
-                or params.get("filePath")
-                or params.get("path")
-                or params.get("filename")
-            )
-            if fp:
-                raw.append(str(fp))
-        out: list[str] = []
-        for p in raw:
-            try:
-                out.append(str(resolve_tool_path(p, self._working_directory)))
-            except Exception:
-                continue
-        return out
-
-    def _record_file_read(self, session_id: str, paths: list[str]) -> None:
-        """Record current mtimes for files just read (or written by us)."""
-        for p in paths:
-            try:
-                pp = Path(p)
-                if pp.is_file():
-                    self._file_read_state[f"{session_id}|{p}"] = pp.stat().st_mtime
-            except OSError:
-                continue
-
-    def _require_read_before_edit(self) -> bool:
-        if self._settings is None:
-            return True
-        return bool(getattr(self._settings, "require_read_before_edit", True))
-
     @staticmethod
     def _frame_untrusted_content(tool_name: str, text: str) -> str:
         """Wrap web/browser tool output so injected directives read as data.
@@ -1457,7 +1411,6 @@ class Agent:
             # that already executed this run. Engines double-submit edits;
             # re-applying an anchored insertion duplicates its block.
             _write_sig: str | None = None
-            _write_targets: list[str] = []
             if tool_name in self._WRITE_GUARD_TOOLS:
                 _write_sig = f"{session_id}|{tool_name}:{json.dumps(tool_call.get_input_dict(), sort_keys=True, ensure_ascii=False)}"
                 if _write_sig in self._executed_write_signatures:
@@ -1473,39 +1426,10 @@ class Agent:
                     yield AgentEvent.tool_result(tool_name, tool_call.id, _dup_msg, True, True)
                     return
 
-                # Stale-read guard: modifying an EXISTING file requires having
-                # read it (view/batch_view), and it must not have changed on
-                # disk since. Creating a new file is exempt. Escape hatch:
-                # settings.require_read_before_edit = false.
-                _write_targets = self._tool_target_paths(tool_name, tool_call.get_input_dict())
-                if self._require_read_before_edit():
-                    _stale_msg: str | None = None
-                    for _t in _write_targets:
-                        try:
-                            _tp = Path(_t)
-                            if not _tp.is_file():
-                                continue
-                            _seen = self._file_read_state.get(f"{session_id}|{_t}")
-                            if _seen is None:
-                                _stale_msg = (
-                                    f"Error: {_t} has not been read this session. "
-                                    "Use the view tool to read it before modifying it."
-                                )
-                                break
-                            if _tp.stat().st_mtime != _seen:
-                                _stale_msg = (
-                                    f"Error: {_t} changed on disk since it was last read. "
-                                    "Re-read it with the view tool before modifying it."
-                                )
-                                break
-                        except OSError:
-                            continue
-                    if _stale_msg:
-                        results_fragment.append(
-                            _persisted_tool_result_dict(tool_call, _stale_msg, True)
-                        )
-                        yield AgentEvent.tool_result(tool_name, tool_call.id, _stale_msg, True, True)
-                        return
+            # NOTE: the stale-read guard lives in the TOOL layer
+            # (clawcode/llm/tools/file_guard.py) so that every caller inherits
+            # it — including execute_code, which invokes WriteTool directly
+            # and would otherwise drive past a guard placed here.
 
             # Read-only tool cache: avoid redundant calls within a single Agent run
             if tool_name in self._READ_ONLY_TOOLS:
@@ -1769,19 +1693,6 @@ class Agent:
                 # Register successful write calls for the duplicate guard
                 if _write_sig is not None and not response.is_error:
                     self._executed_write_signatures.add(_write_sig)
-                # Stale-read bookkeeping: reads register the file; our own
-                # successful writes refresh it (so follow-up edits pass).
-                if not response.is_error:
-                    if tool_name in ("view", "batch_view"):
-                        self._record_file_read(
-                            session_id,
-                            self._tool_target_paths(tool_name, tool_call.get_input_dict()),
-                        )
-                    elif tool_name in self._WRITE_GUARD_TOOLS:
-                        self._record_file_read(
-                            session_id,
-                            _write_targets or self._tool_target_paths(tool_name, tool_call.get_input_dict()),
-                        )
                 # --- Hook: PostToolUse / PostToolUseFailure (non-streaming) ---
                 if self._hook_engine:
                     _post_event = (

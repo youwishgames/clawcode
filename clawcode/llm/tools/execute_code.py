@@ -627,9 +627,22 @@ def patch(path=None, old_string=None, new_string=None, replace_all=False, mode="
     content = file_obj.get("content", "")
     if mode != "replace":
         return {"success": False, "error": f"Unsupported patch mode: {mode}"}
+    n_found = content.count(old_string)
+    if n_found == 0:
+        return {"success": False, "error": "old_string not found; re-read the file"}
     if replace_all:
         new_content = content.replace(old_string, new_string)
     else:
+        # Uniqueness required — an ambiguous match silently rewriting N
+        # locations is how files get corrupted (same rule as the edit tool).
+        if n_found > 1:
+            return {
+                "success": False,
+                "error": (
+                    f"old_string matches {n_found} locations; add surrounding "
+                    "context to make it unique, or pass replace_all=True"
+                ),
+            }
         new_content = content.replace(old_string, new_string, 1)
     return write_file(path, new_content)
 
