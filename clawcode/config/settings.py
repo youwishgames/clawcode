@@ -636,6 +636,15 @@ class Settings(BaseSettings):
     max_concurrent_tools: int = 5
     max_concurrent_subagents: int = 3
 
+    #: Stale-read guard: modifying an existing file requires having read it
+    #: (view/batch_view) this session, unchanged on disk since. Fork safety
+    #: divergence — set false to restore upstream behavior.
+    require_read_before_edit: bool = True
+
+    #: Loop breaker: stop the run after this many CONSECUTIVE tool rounds in
+    #: which every result was an error (0 disables). Fork safety divergence.
+    max_consecutive_tool_failures: int = 3
+
     # Context paths for loading project instructions
     context_paths: list[str] = Field(default_factory=lambda: list(DEFAULT_CONTEXT_PATHS))
 
