@@ -43,10 +43,22 @@ class TestClient(Client):
             text = getattr(getattr(update, "content", None), "text", "")
             print(f"\n[THOUGHT] {text[:200]}", flush=True)
         elif kind == "ToolCallStart":
-            print(f"\n[TOOL START] {update.title} (kind={update.kind}, status={update.status})", flush=True)
+            locs = [l.path for l in (update.locations or [])]
+            print(f"\n[TOOL START] {update.title} (kind={update.kind}, status={update.status}, locations={locs})", flush=True)
         elif kind == "ToolCallProgress":
-            n = len(update.content or [])
-            print(f"\n[TOOL UPDATE] id={update.tool_call_id} status={update.status} content_blocks={n}", flush=True)
+            parts = []
+            for c in update.content or []:
+                cn = type(c).__name__
+                if cn == "FileEditToolCallContent":
+                    old = c.old_text or ""
+                    print(f"\n[DIFF CARD] {c.path} old={len(old)}ch new={len(c.new_text)}ch", flush=True)
+                parts.append(cn)
+            print(f"\n[TOOL UPDATE] id={update.tool_call_id} status={update.status} content={parts}", flush=True)
+        elif kind == "AgentPlanUpdate":
+            for e in update.entries:
+                print(f"\n[PLAN] [{e.status}] {e.content}", flush=True)
+        elif kind == "UsageUpdate":
+            print(f"\n[USAGE] {update.used}/{update.size} tokens", flush=True)
         elif kind == "AvailableCommandsUpdate":
             names = [c.name for c in update.available_commands]
             print(f"\n[COMMANDS] {len(names)} slash commands: {names[:8]}...", flush=True)
@@ -73,6 +85,9 @@ async def main() -> None:
 
         session = await conn.new_session(cwd=cwd, mcp_servers=[])
         print(f"[SESSION] {session.session_id}")
+        for opt in session.config_options or []:
+            vals = [o.value for o in (opt.options or [])][:6]
+            print(f"[CONFIG] {opt.id}={opt.current_value} options={vals}")
 
         result = await asyncio.wait_for(
             conn.prompt(session_id=session.session_id, prompt=[text_block(prompt_text)]),

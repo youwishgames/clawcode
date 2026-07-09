@@ -41,10 +41,14 @@ stdout carries JSON-RPC; all logging goes to stderr. `--cwd` pre-warms the runti
 |---|---|
 | `AgentEventType.CONTENT_DELTA` | `agent_message_chunk` (streaming text) |
 | `AgentEventType.THINKING` | `agent_thought_chunk` |
-| `AgentEventType.TOOL_USE` / `TOOL_RESULT` | `tool_call` / `tool_call_update` rows |
+| `AgentEventType.TOOL_USE` / `TOOL_RESULT` | `tool_call` / `tool_call_update` rows, with `locations` (clickable file paths) |
+| file writes (`write`/`edit`/`patch`) | diff card (`FileEditToolCallContent`): file snapshotted at TOOL_USE, diffed after |
+| `todo_write` tool (added by the shim) | `plan` update — live task checklist in the panel |
+| `AgentEventType.USAGE` | `usage_update` (token meter vs. the model's context window) |
 | `PermissionService` callback | `session/request_permission` (allow once / allow for session / reject) |
 | Plugin skills (`pm.get_all_skills()`) | `available_commands_update` (slash autocomplete) |
 | `/skill` messages | expanded via `plugin.slash.dispatch_slash`, same as the TUI |
+| config option `model` | model picker — lists models from enabled providers in `.clawcode.json`; switching rebuilds the session's agent on the new engine |
 
 Each ACP session creates one ClawCode session (visible later in the TUI sidebar) with a full `tui_coder`-style runtime: system prompt, skills, MCP servers, and per-session permission grants.
 
@@ -59,5 +63,5 @@ Each ACP session creates one ClawCode session (visible later in the TUI sidebar)
 ## Limitations
 
 - One working directory per shim process (first session wins; a warning is logged if a later session asks for a different cwd).
-- Model switching from the panel is not wired; the engine comes from `.clawcode.json` (`agents.coder.model`).
+- Model switching from the panel changes the in-memory agent config only — it does not persist to `.clawcode.json`, and it applies process-wide (new sessions inherit the last switch).
 - `session/load` (history replay) is not implemented.
